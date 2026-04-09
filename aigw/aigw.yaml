@@ -1,0 +1,120 @@
+# ---------------------------------------------------------------------------
+# AI Gateway (AIGW) – MCP Demo Configuration
+#
+# This file configures F5 AI Gateway to proxy requests to the MCP server
+# and enforces authentication, rate-limiting, and policy controls centrally.
+#
+# Docs: https://docs.nginx.com/nginx-one/aigw/
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 1. AI Services (upstream LLM providers)
+# ---------------------------------------------------------------------------
+services:
+  - name: openai-gpt4o
+    type: openai
+    config:
+      endpoint: https://api.openai.com/v1
+      model: gpt-4o
+      # Store the API key in the environment variable OPENAI_API_KEY
+      apiKeyEnvVar: OPENAI_API_KEY
+
+  - name: anthropic-claude
+    type: anthropic
+    config:
+      endpoint: https://api.anthropic.com/v1
+      model: claude-3-5-sonnet-20241022
+      apiKeyEnvVar: ANTHROPIC_API_KEY
+
+# ---------------------------------------------------------------------------
+# 2. MCP Tool Sources
+# ---------------------------------------------------------------------------
+mcpServers:
+  - name: demo-tools
+    # Transport: SSE (HTTP) – the MCP server must be started with an SSE
+    # transport adapter (see mcp_server/README.md).
+    transport: sse
+    url: http://mcp-server:8000/sse
+    # Optional: restrict which tools are visible through this gateway entry
+    allowedTools:
+      - calculator
+      - get_current_time
+      - unit_converter
+      - text_analyzer
+      - json_formatter
+
+# ---------------------------------------------------------------------------
+# 3. Listeners / Routes
+# ---------------------------------------------------------------------------
+listeners:
+  - name: public-api
+    address: 0.0.0.0
+    port: 4141
+    routes:
+      # --- Route: OpenAI-compatible chat endpoint with MCP tools -----------
+      - path: /v1/chat/completions
+        methods: [POST]
+        service: openai-gpt4o
+        mcpServers:
+          - demo-tools
+        policies:
+          - authentication
+          - rate-limit
+          - input-guard
+
+      # --- Route: Anthropic messages endpoint with MCP tools ---------------
+      - path: /anthropic/v1/messages
+        methods: [POST]
+        service: anthropic-claude
+        mcpServers:
+          - demo-tools
+        policies:
+          - authentication
+          - rate-limit
+
+      # --- Route: MCP tool discovery (unauthenticated for demo purposes) ---
+      - path: /mcp/tools
+        methods: [GET]
+        mcpServers:
+          - demo-tools
+        policies: []
+
+# ---------------------------------------------------------------------------
+# 4. Policies
+# ---------------------------------------------------------------------------
+policies:
+
+  # -- Authentication -------------------------------------------------------
+  - name: authentication
+    type: jwt
+    config:
+      # Accept a Bearer token signed with HS256 using the secret in
+      # the environment variable AIGW_JWT_SECRET.
+      algorithm: HS256
+      secretEnvVar: AIGW_JWT_SECRET
+      claims:
+        # Require the 'sub' claim to be present
+        required:
+          - sub
+
+  # -- Rate Limiting --------------------------------------------------------
+  - name: rate-limit
+    type: rateLimit
+    config:
+      # Per-user limit (identified by JWT 'sub' claim)
+      windowSeconds: 60
+      requestsPerWindow: 60
+      keyField: jwt.sub
+
+  # -- Input Guard (prompt injection / PII detection) -----------------------
+  - name: input-guard
+    type: inputGuard
+    config:
+      # Block obvious prompt-injection attempts
+      blockPromptInjection: true
+      # Redact PII before forwarding to the LLM
+      redactPii: true
+      piiEntities:
+        - EMAIL_ADDRESS
+        - PHONE_NUMBER
+        - CREDIT_CARD
