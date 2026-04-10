@@ -1,0 +1,168 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mcp-k8s-sa
+  namespace: default
+---
+# WARNING: 'cluster-admin' is perfect for a stage demo so the AI 
+# can read logs and edit ConfigMaps anywhere. For production, ALWAYS 
+# use a scoped 'Role' to restrict the AI to a specific namespace!
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mcp-k8s-admin-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin 
+subjects:
+- kind: ServiceAccount
+  name: mcp-k8s-sa
+  namespace: default
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-server-kubernetes
+  namespace: default
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: mcp-server-kubernetes
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      creationTimestamp: null
+      labels:
+        app: mcp-server-kubernetes
+    spec:
+      containers:
+      - command:
+        - sh
+        - -c
+        - "set -e\napk add --no-cache curl\ncurl -LO \"https://dl.k8s.io/release/$(curl
+          -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl\"\ninstall
+          -o root -g root -m 0755 kubectl /usr/local/bin/kubectl\nnpm install -g mcp-server-kubernetes@latest\n\ncat
+          > /tmp/bridge.mjs << 'BRIDGE_SCRIPT'\nimport { spawn } from \"child_process\";\nimport
+          { createServer } from \"http\";\n\nconst PORT = parseInt(process.env.PORT
+          || \"9090\");\n\n// Spawn MCP server on stdio\nconst proc = spawn(\"npx\",
+          [\"-y\", \"mcp-server-kubernetes@latest\"], {\n  stdio: [\"pipe\", \"pipe\",
+          process.stderr],\n});\n\nproc.on(\"error\", (err) => {\n  console.error(\"Subprocess
+          error:\", err);\n  process.exit(1);\n});\n\nproc.on(\"exit\", (code) =>
+          {\n  console.error(\"Subprocess exited:\", code);\n  process.exit(1);\n});\n\nconst
+          pending = new Map();\nlet stdoutBuf = \"\";\n\nproc.stdout.on(\"data\",
+          (chunk) => {\n  stdoutBuf += chunk.toString();\n\n  // Try multiple parsing
+          strategies\n  // Strategy 1: Content-Length framed messages (LSP-style)\n
+          \ while (true) {\n    const headerMatch = stdoutBuf.match(/^Content-Length:\\s*(\\d+)\\r?\\n\\r?\\n/);\n
+          \   if (headerMatch) {\n      const len = parseInt(headerMatch[1]);\n      const
+          headerLen = headerMatch[0].length;\n      if (stdoutBuf.length >= headerLen
+          + len) {\n        const jsonStr = stdoutBuf.substring(headerLen, headerLen
+          + len);\n        stdoutBuf = stdoutBuf.substring(headerLen + len);\n        processMessage(jsonStr);\n
+          \       continue;\n      }\n      break; // Wait for more data\n    }\n\n
+          \   // Strategy 2: Newline-delimited JSON\n    const nlIndex = stdoutBuf.indexOf(\"\\n\");\n
+          \   if (nlIndex !== -1) {\n      const line = stdoutBuf.substring(0, nlIndex).trim();\n
+          \     stdoutBuf = stdoutBuf.substring(nlIndex + 1);\n      if (line) {\n
+          \       processMessage(line);\n      }\n      continue;\n    }\n\n    //
+          Strategy 3: Try to parse the whole buffer as JSON\n    // (in case there's
+          no newline yet but it's complete JSON)\n    try {\n      JSON.parse(stdoutBuf);\n
+          \     // If it parses, it's a complete message\n      processMessage(stdoutBuf.trim());\n
+          \     stdoutBuf = \"\";\n      continue;\n    } catch {\n      // Not complete
+          yet\n    }\n\n    break;\n  }\n});\n\nfunction processMessage(jsonStr) {\n
+          \ try {\n    const msg = JSON.parse(jsonStr);\n    console.log(`  ← response
+          (id: ${msg.id}, method: ${msg.method || \"n/a\"})`);\n    \n    if (msg.id
+          !== undefined && pending.has(msg.id)) {\n      const { res, timer } = pending.get(msg.id);\n
+          \     clearTimeout(timer);\n      pending.delete(msg.id);\n      \n      const
+          body = JSON.stringify(msg);\n      res.writeHead(200, {\n        \"Content-Type\":
+          \"application/json\",\n        \"Content-Length\": Buffer.byteLength(body),\n
+          \     });\n      res.end(body);\n    }\n  } catch (e) {\n    console.error(\"Failed
+          to parse subprocess output:\", e.message, jsonStr.substring(0, 100));\n
+          \ }\n}\n\n// Try BOTH formats when writing to stdin\nfunction sendToProcess(msg)
+          {\n  const json = JSON.stringify(msg);\n  // Use newline-delimited JSON
+          (simplest stdio protocol)\n  proc.stdin.write(json + \"\\n\");\n}\n\nconst
+          server = createServer((req, res) => {\n  res.setHeader(\"Access-Control-Allow-Origin\",
+          \"*\");\n  res.setHeader(\"Access-Control-Allow-Methods\", \"GET, POST,
+          DELETE, OPTIONS\");\n  res.setHeader(\"Access-Control-Allow-Headers\", \"Content-Type,
+          Accept, Mcp-Session-Id\");\n  res.setHeader(\"Access-Control-Expose-Headers\",
+          \"Mcp-Session-Id\");\n\n  if (req.method === \"OPTIONS\") {\n    res.writeHead(204);\n
+          \   return res.end();\n  }\n\n  if (req.method === \"POST\" && (req.url
+          === \"/mcp\" || req.url === \"/\")) {\n    let body = \"\";\n    req.on(\"data\",
+          (c) => (body += c));\n    req.on(\"end\", () => {\n      try {\n        const
+          msg = JSON.parse(body);\n        console.log(`→ ${msg.method || \"response\"}
+          (id: ${msg.id})`);\n\n        // Notifications (no id)\n        if (msg.id
+          === undefined || msg.id === null) {\n          sendToProcess(msg);\n          res.writeHead(202);\n
+          \         return res.end();\n        }\n\n        const timer = setTimeout(()
+          => {\n          if (pending.has(msg.id)) {\n            pending.delete(msg.id);\n
+          \           console.error(`⏰ Timeout: ${msg.method} (id: ${msg.id})`);\n
+          \           res.writeHead(504, { \"Content-Type\": \"application/json\"
+          });\n            res.end(JSON.stringify({\n              jsonrpc: \"2.0\",\n
+          \             id: msg.id,\n              error: { code: -32000, message:
+          \"Timeout\" },\n            }));\n          }\n        }, 25000);\n\n        pending.set(msg.id,
+          { res, timer });\n        sendToProcess(msg);\n      } catch (e) {\n        res.writeHead(400,
+          { \"Content-Type\": \"application/json\" });\n        res.end(JSON.stringify({
+          error: e.message }));\n      }\n    });\n    return;\n  }\n\n  if (req.method
+          === \"DELETE\" && (req.url === \"/mcp\" || req.url === \"/\")) {\n    res.writeHead(200);\n
+          \   return res.end();\n  }\n\n  if (req.method === \"GET\" && (req.url ===
+          \"/mcp\" || req.url === \"/\")) {\n    res.writeHead(200, { \"Content-Type\":
+          \"application/json\" });\n    return res.end('{\"status\":\"ok\"}');\n  }\n\n
+          \ res.writeHead(404);\n  res.end(\"Not found\");\n});\n\nserver.listen(PORT,
+          \"0.0.0.0\", () => {\n  console.log(\"=== Streamable HTTP Bridge ===\");\n
+          \ console.log(\"Listening on port \" + PORT);\n  console.log(\"POST /mcp
+          -> stdio -> mcp-server-kubernetes\");\n});\nBRIDGE_SCRIPT\n\nexec node /tmp/bridge.mjs\n"
+        env:
+        - name: PORT
+          value: "9090"
+        image: node:22-alpine
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /mcp
+            port: 9090
+            scheme: HTTP
+          initialDelaySeconds: 60
+          periodSeconds: 15
+          successThreshold: 1
+          timeoutSeconds: 1
+        name: mcp-server
+        ports:
+        - containerPort: 9090
+          protocol: TCP
+        readinessProbe:
+          failureThreshold: 12
+          httpGet:
+            path: /mcp
+            port: 9090
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 5
+          successThreshold: 1
+          timeoutSeconds: 1
+        resources: {}
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      serviceAccount: mcp-k8s-sa
+      serviceAccountName: mcp-k8s-sa
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-k8s-svc
+  namespace: default
+spec:
+  selector:
+    app: mcp-server-kubernetes
+  ports:
+  - port: 9090
+    targetPort: 9090
