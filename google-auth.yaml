@@ -1,0 +1,19 @@
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: google-oauth-policy
+  namespace: default
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io 
+    kind: Gateway 
+    name: envoy-ai-gateway-basic
+  jwt:
+    providers:
+      - name: google-provider
+        issuer: "https://accounts.google.com" 
+        audiences: 
+          - "1234567890-abcdefghijklmnopqrstuvwxyz.apps.googleusercontent.com"
+        remoteJWKS:
+          uri: "https://www.googleapis.com/oauth2/v3/certs"
+---
