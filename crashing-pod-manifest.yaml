@@ -1,0 +1,55 @@
+# this manifest defines a deployment that will crash because of an intentional bug in the GREETING env var.
+# for showing K8 MCP features for debugging and troubleshooting.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crashing-hello
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: crashing-hello
+  template:
+    metadata:
+      labels:
+        app: crashing-hello
+    spec:
+      containers:
+      - name: hello
+        image: node:18-alpine
+        command: ["sh", "-c"]
+        args:
+          - |
+            if [ "$GREETING" != "hello" ]; then
+              echo "Missing or wrong GREETING env var"
+              exit 1
+            fi
+            node -e "
+              require('http')
+                .createServer((req,res)=>{
+                  if(req.url === '/hello'){
+                    res.end('helloworld')
+                  } else {
+                    res.end('not found')
+                  }
+                })
+                .listen(3000)"
+        env:
+        - name: GREETING
+          value: "hello1"   # 💥 intentional bug
+        ports:
+        - containerPort: 3000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: crashing-hello
+  namespace: default
+spec:
+  selector:
+    app: crashing-hello
+  ports:
+  - port: 80
+    targetPort: 3000
+---
