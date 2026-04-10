@@ -1,0 +1,37 @@
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: Backend
+metadata:
+  name: k8s-mcp-backend
+  namespace: default
+spec:
+  endpoints:
+    - fqdn:
+        hostname: mcp-k8s-svc.default.svc.cluster.local
+        port: 9090
+---
+# This is a combined MCPRoute that includes both the GitHub backend and the Kubernetes MCP backend.
+apiVersion: aigateway.envoyproxy.io/v1alpha1
+kind: MCPRoute
+metadata:
+  name: mcp-route-combined
+  namespace: default
+spec:
+  parentRefs:
+    - name: envoy-ai-gateway-basic
+      kind: Gateway
+      group: gateway.networking.k8s.io
+  path: "/mcp"
+  backendRefs:
+    - name: github
+      kind: Backend
+      group: gateway.envoyproxy.io
+      path: "/mcp/x/issues/readonly"
+      securityPolicy:
+        apiKey:
+          secretRef:
+            name: github-token
+    - name: k8s-mcp-backend
+      kind: Backend
+      group: gateway.envoyproxy.io 
+      path: /mcp
+---
